@@ -11,8 +11,12 @@ target/
 .classpath
 
 # Logs
-*.log
+logs/*.log
+!logs/.gitkeep
 
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 配置
+application.properties

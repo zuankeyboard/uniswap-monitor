@@ -6,6 +6,9 @@ import org.springframework.context.annotation.Bean;
 import org.web3j.protocol.Web3j;
 import org.web3j.protocol.http.HttpService;
 
+import com.example.uniswap.config.UniswapV3Config;
+
+
 @SpringBootApplication
 public class Application {
 
@@ -13,9 +16,8 @@ public class Application {
         SpringApplication.run(Application.class, args);
     }
 
-    @Bean
-    public Web3j web3j() {
-        // 使用 HTTP 连接（稳定且免费层可用）
-        return Web3j.build(new HttpService("https://eth-mainnet.g.alchemy.com/v2/Pf_TDVX0AZrk_GqRLuwqL"));
+    @Bean(destroyMethod = "shutdown")
+    public Web3j web3j(UniswapV3Config config) {
+        return Web3j.build(new HttpService(config.getHttpRpcUrl()));
     }
 }

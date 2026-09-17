@@ -2,6 +2,8 @@ package com.example.uniswap.listener;
 
 import com.example.uniswap.config.UniswapV3Config;
 import com.example.uniswap.model.SwapData;
+import com.example.uniswap.service.SupabaseEventPersistence;
+import org.springframework.stereotype.Component;
 import org.web3j.abi.EventEncoder;
 import org.web3j.abi.FunctionReturnDecoder;
 import org.web3j.abi.TypeReference;
@@ -9,16 +11,28 @@ import org.web3j.abi.datatypes.*;
 import org.web3j.abi.datatypes.generated.*;
 import org.web3j.protocol.Web3j;
 import org.web3j.protocol.websocket.events.Log;
-import org.web3j.protocol.websocket.events.LogNotification;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import io.reactivex.disposables.CompositeDisposable;
+import io.reactivex.disposables.Disposable;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.math.RoundingMode;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
+@Component
 public class SwapEventListener {
+
+        private static final Logger log = LoggerFactory.getLogger(SwapEventListener.class);
+        private static SupabaseEventPersistence persistence;
+
+        public SwapEventListener(SupabaseEventPersistence persistence) {
+                SwapEventListener.persistence = persistence;
+        }
 
         // ==================== 事件定义 ====================
         // Swap 事件
@@ -78,29 +92,32 @@ public class SwapEventListener {
         public static final String BURN_EVENT_SIGNATURE = EventEncoder.encode(BURN_EVENT);
 
         // ==================== 启动监听 ====================
-        public static void startListening(Web3j web3j) {
-                // 只监听池子地址，不限制主题（将接收所有事件）
+        public static Disposable startListening(Web3j web3j) {
                 List<String> addresses = Arrays.asList(UniswapV3Config.POOL_ADDRESS);
-                // List<String> topics = null; // null 表示不按主题过滤
-                List<String> topics = new ArrayList<>(); // 空列表表示不限制主题
+                CompositeDisposable subscriptions = new CompositeDisposable();
+                subscriptions.add(subscribe(web3j, addresses, SWAP_EVENT_SIGNATURE, SwapEventListener::handleSwap));
+                subscriptions.add(subscribe(web3j, addresses, MINT_EVENT_SIGNATURE, SwapEventListener::handleMint));
+                subscriptions.add(subscribe(web3j, addresses, BURN_EVENT_SIGNATURE, SwapEventListener::handleBurn));
 
-                web3j.logsNotifications(addresses, topics).subscribe(
+                log.info("WebSocket 订阅已启动，监听池子 {} 的 Swap、Mint、Burn 事件", UniswapV3Config.POOL_ADDRESS);
+                return subscriptions;
+        }
+
+        private static Disposable subscribe(Web3j web3j, List<String> addresses, String signature,
+                        java.util.function.Consumer<Log> handler) {
+                return web3j.logsNotifications(addresses, Arrays.asList(signature)).subscribe(
                                 notification -> {
-                                        Log log = notification.getParams().getResult();
-                                        String eventSignature = log.getTopics().get(0); // 事件签名
-                                        if (SWAP_EVENT_SIGNATURE.equals(eventSignature)) {
-                                                handleSwap(log);
-                                        } else if (MINT_EVENT_SIGNATURE.equals(eventSignature)) {
-                                                handleMint(log);
-                                        } else if (BURN_EVENT_SIGNATURE.equals(eventSignature)) {
-                                                handleBurn(log);
-                                        } else {
-                                                // 其他事件忽略
+                                        Log eventLog = notification.getParams().getResult();
+                                        log.info("收到链上事件: signature={}, topics={}", signature,
+                                                        eventLog.getTopics().size());
+                                        try {
+                                                handler.accept(eventLog);
+                                        } catch (RuntimeException exception) {
+                                                log.error("事件解码失败: signature={}, topics={}, data={}",
+                                                                signature, eventLog.getTopics(), eventLog.getData(), exception);
                                         }
                                 },
-                                error -> System.err.println("监听出错: " + error.getMessage()));
-
-                System.out.println("已启动 WebSocket 订阅，监听 Swap / Mint / Burn 事件...");
+                                error -> log.error("事件订阅失败: signature={}", signature, error));
         }
 
         // ==================== 各事件处理 ====================
@@ -109,8 +126,12 @@ public class SwapEventListener {
                 // 添加买卖方向
                 String type = determineSwapType(data.amount0, data.amount1);
                 data.type = type;
-                printSwapData(data);
-                // System.out.println("=== 略过swap ===");
+
+                SwapEventListener.log.info(
+                                "[SWAP] 交易哈希: {} | 区块号: {} | 发送者: {} | 接收者: {} | 方向: {} | WETH: {} | USDT: {} | 价格: {} USDT/WETH | 流动性: {} | Tick: {}",
+                                data.transactionHash, data.blockNumber, data.sender, data.recipient, data.type,
+                                data.amount0, data.amount1, data.sqrtPriceX96, data.liquidity, data.tick);
+                persistence.saveSwap(data);
         }
 
         private static void handleMint(Log log) {
@@ -128,19 +149,23 @@ public class SwapEventListener {
                 BigInteger amount0 = (BigInteger) ((Uint256) nonIndexed.get(2)).getValue();
                 BigInteger amount1 = (BigInteger) ((Uint256) nonIndexed.get(3)).getValue();
 
-                double wethAmount = amount0.doubleValue() / 1e18;
-                double usdtAmount = amount1.doubleValue() / 1e6;
+                BigDecimal wethAmount = new BigDecimal(amount0).movePointLeft(18);
+                BigDecimal usdtAmount = new BigDecimal(amount1).movePointLeft(6);
 
-                System.out.println("=== 添加流动性 (Mint) ===");
-                System.out.println("发送者: " + sender);
-                System.out.println("所有者: " + owner);
-                System.out.println("价格区间 tick: " + tickLower + " - " + tickUpper);
-                System.out.println("流动性数量: " + amount);
-                System.out.println("存入 WETH: " + wethAmount);
-                System.out.println("存入 USDT: " + usdtAmount);
-                System.out.println("交易哈希: " + log.getTransactionHash());
-                System.out.println("区块号: " + new BigInteger(log.getBlockNumber().substring(2), 16).toString());
-                System.out.println("---");
+                SwapEventListener.log.info(
+                                "[MINT] 发送者: {} | 所有者: {} | Tick范围: {} - {} | 流动性: {} | WETH: {} | USDT: {} | 交易哈希: {} | 区块号: {}",
+                                sender, owner, tickLower, tickUpper, amount, wethAmount.toPlainString(),
+                                usdtAmount.toPlainString(), log.getTransactionHash(),
+                                parseHexNumber(log.getBlockNumber()));
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("sender", sender);
+                payload.put("owner", owner);
+                payload.put("tick_lower", tickLower);
+                payload.put("tick_upper", tickUpper);
+                payload.put("liquidity", amount.toString());
+                payload.put("amount0", amount0.toString());
+                payload.put("amount1", amount1.toString());
+                persistence.saveRawEvent("MINT", log.getTransactionHash(), parseHexNumber(log.getBlockNumber()), payload);
         }
 
         private static void handleBurn(Log log) {
@@ -157,18 +182,22 @@ public class SwapEventListener {
                 BigInteger amount0 = (BigInteger) ((Uint256) nonIndexed.get(1)).getValue();
                 BigInteger amount1 = (BigInteger) ((Uint256) nonIndexed.get(2)).getValue();
 
-                double wethAmount = amount0.doubleValue() / 1e18;
-                double usdtAmount = amount1.doubleValue() / 1e6;
+                BigDecimal wethAmount = new BigDecimal(amount0).movePointLeft(18);
+                BigDecimal usdtAmount = new BigDecimal(amount1).movePointLeft(6);
 
-                System.out.println("=== 移除流动性 (Burn) ===");
-                System.out.println("所有者: " + owner);
-                System.out.println("价格区间 tick: " + tickLower + " - " + tickUpper);
-                System.out.println("销毁流动性数量: " + amount);
-                System.out.println("赎回 WETH: " + wethAmount);
-                System.out.println("赎回 USDT: " + usdtAmount);
-                System.out.println("交易哈希: " + log.getTransactionHash());
-                System.out.println("区块号: " + new BigInteger(log.getBlockNumber().substring(2), 16).toString());
-                System.out.println("---");
+                SwapEventListener.log.info(
+                                "[BURN] 所有者: {} | Tick范围: {} - {} | 流动性: {} | WETH: {} | USDT: {} | 交易哈希: {} | 区块号: {}",
+                                owner, tickLower, tickUpper, amount, wethAmount.toPlainString(),
+                                usdtAmount.toPlainString(), log.getTransactionHash(),
+                                parseHexNumber(log.getBlockNumber()));
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("owner", owner);
+                payload.put("tick_lower", tickLower);
+                payload.put("tick_upper", tickUpper);
+                payload.put("liquidity", amount.toString());
+                payload.put("amount0", amount0.toString());
+                payload.put("amount1", amount1.toString());
+                persistence.saveRawEvent("BURN", log.getTransactionHash(), parseHexNumber(log.getBlockNumber()), payload);
         }
 
         // ==================== Swap 解码 ====================
@@ -208,8 +237,8 @@ public class SwapEventListener {
                 BigInteger liquidity = (BigInteger) ((Uint128) nonIndexed.get(idx++)).getValue();
                 BigInteger tick = (BigInteger) ((Int24) nonIndexed.get(idx++)).getValue();
 
-                double wethDecimal = amount0.doubleValue() / 1e18;
-                double usdtDecimal = amount1.doubleValue() / 1e6;
+                BigDecimal wethDecimal = new BigDecimal(amount0).movePointLeft(18);
+                BigDecimal usdtDecimal = new BigDecimal(amount1).movePointLeft(6);
 
                 // 价格计算
                 BigDecimal sqrtPrice = new BigDecimal(sqrtPriceX96)
@@ -219,8 +248,8 @@ public class SwapEventListener {
                 SwapData dataObj = new SwapData();
                 dataObj.sender = sender;
                 dataObj.recipient = recipient;
-                dataObj.amount0 = Double.toString(wethDecimal);
-                dataObj.amount1 = Double.toString(usdtDecimal);
+                dataObj.amount0 = wethDecimal.toPlainString();
+                dataObj.amount1 = usdtDecimal.toPlainString();
                 dataObj.sqrtPriceX96 = price.toString();
                 dataObj.liquidity = liquidity.toString();
                 dataObj.tick = tick.toString();
@@ -228,6 +257,10 @@ public class SwapEventListener {
                 dataObj.blockNumber = blockNumber;
                 dataObj.type = determineSwapType(dataObj.amount0, dataObj.amount1); // 设置买卖方向
                 return dataObj;
+        }
+
+        private static String parseHexNumber(String value) {
+                return new BigInteger(value.substring(2), 16).toString();
         }
 
         private static String determineSwapType(String amount0Str, String amount1Str) {
@@ -242,20 +275,5 @@ public class SwapEventListener {
                 } else {
                         return "未知方向";
                 }
-        }
-
-        private static void printSwapData(SwapData data) {
-                System.out.println("=== Swap 交易 ===");
-                System.out.println("交易哈希: " + data.transactionHash);
-                System.out.println("区块号: " + data.blockNumber);
-                System.out.println("发送者: " + data.sender);
-                System.out.println("接收者: " + data.recipient);
-                System.out.println("方向: " + data.type);
-                System.out.println("WETH 变动: " + data.amount0);
-                System.out.println("USDT 变动: " + data.amount1);
-                System.out.println("价格: " + data.sqrtPriceX96 + " USDT/WETH");
-                System.out.println("流动性: " + data.liquidity);
-                System.out.println("Tick: " + data.tick);
-                System.out.println("---");
         }
 }

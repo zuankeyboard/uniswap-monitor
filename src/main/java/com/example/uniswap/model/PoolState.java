@@ -6,4 +6,6 @@ public class PoolState {
     public String liquidity;
     public String usdtBalance;
     public String wethBalance;
+    public String blockNumber;
+    public String updatedAt;
 }
